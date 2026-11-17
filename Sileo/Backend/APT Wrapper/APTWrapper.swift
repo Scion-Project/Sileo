@@ -286,12 +286,8 @@ class APTWrapper {
             
             let spawnStatus: Int32 
             if #available(iOS 13, *) {
-                var attr: posix_spawnattr_t?
-                posix_spawnattr_init(&attr)
-                posix_spawnattr_set_persona_np(&attr, 99, UInt32(POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE));
-                posix_spawnattr_set_persona_uid_np(&attr, 0);
-                posix_spawnattr_set_persona_gid_np(&attr, 0);
-                spawnStatus = posix_spawn(&pid, command, &fileActions, &attr, argv + [nil], env + [nil])
+                // persona 99, or giveMeRoot where the kernel refuses that (RootSpawn, RootWrapper.swift)
+                spawnStatus = RootSpawn.spawn(&pid, command: command, fileActions: &fileActions, args: arguments, env: environment)
             } else {
                 guard let giveMeRootPath = Bundle.main.path(forAuxiliaryExecutable: "giveMeRoot") else {
                     fatalError("Unable to find giveMeRoot")
@@ -300,6 +296,11 @@ class APTWrapper {
             }
             
             if spawnStatus != 0 {
+                // Without this the queue stayed at "Queued" for ever: say why and end the install as failed
+                for fd in pipestdout + pipestderr + pipestatusfd + pipesileo { close(fd) }
+                outputCallback("E: Sileo could not start apt-get as root: \(String(cString: strerror(spawnStatus))) (\(spawnStatus))\n",
+                               Int(STDERR_FILENO))
+                completionCallback(Int(spawnStatus), finish, false)
                 return
             }
 

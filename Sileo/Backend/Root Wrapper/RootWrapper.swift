@@ -116,6 +116,65 @@ final public class MacRootWrapper {
 }
 #endif
 
+#if !targetEnvironment(macCatalyst) && !targetEnvironment(simulator) && !TARGET_SANDBOX
+/// Starting a program as root, on iOS 13 and later.
+///
+/// Sileo asks the kernel to spawn the program into persona 99 with uid and gid 0. A kernel that refuses (one with no
+/// persona 99 and no stand-in for it, as on ports of iOS to other hardware) fails that posix_spawn before the program
+/// runs, and the install then stopped without a word: the queue stayed at "Queued" for ever. In that case the program
+/// is started through giveMeRoot, the set-user-ID helper in the app bundle (the way Sileo becomes root on iOS 12 and
+/// earlier), which checks that its parent is Sileo, becomes root and executes the program. The first refusal is
+/// remembered, so later spawns go to giveMeRoot directly.
+enum RootSpawn {
+    private static let lock = NSLock()
+    private static var personaRefused = false
+
+    /// Like posix_spawn(), with `args` as Sileo builds them (args[0] the program's name). Returns 0 or an errno.
+    static func spawn(_ pid: UnsafeMutablePointer<pid_t>,
+                      command: String,
+                      fileActions: UnsafePointer<posix_spawn_file_actions_t?>?,
+                      args: [String],
+                      env: [String]) -> Int32 {
+        let envp: [UnsafeMutablePointer<CChar>?] = env.map { $0.withCString(strdup) }
+        defer { for case let pointer? in envp { free(pointer) } }
+
+        lock.lock()
+        let tryPersona = !personaRefused
+        lock.unlock()
+
+        var status: Int32 = ENOENT
+        if tryPersona {
+            let argv: [UnsafeMutablePointer<CChar>?] = args.map { $0.withCString(strdup) }
+            defer { for case let pointer? in argv { free(pointer) } }
+            var attr: posix_spawnattr_t?
+            posix_spawnattr_init(&attr)
+            defer { posix_spawnattr_destroy(&attr) }
+            posix_spawnattr_set_persona_np(&attr, 99, UInt32(POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE))
+            posix_spawnattr_set_persona_uid_np(&attr, 0)
+            posix_spawnattr_set_persona_gid_np(&attr, 0)
+            status = posix_spawn(pid, command, fileActions, &attr, argv + [nil], envp + [nil])
+            if status == 0 {
+                return 0
+            }
+            lock.lock()
+            personaRefused = true
+            lock.unlock()
+            NSLog("[Sileo] spawn into persona 99 refused (%d: %@); using giveMeRoot from now on",
+                  status, String(cString: strerror(status)))
+        }
+
+        guard let giveMeRootPath = Bundle.main.path(forAuxiliaryExecutable: "giveMeRoot") else {
+            return status
+        }
+        // giveMeRoot executes its first argument, with the rest as that program's argv
+        let helperArgs = ["giveMeRoot", command] + args.dropFirst()
+        let argv: [UnsafeMutablePointer<CChar>?] = helperArgs.map { $0.withCString(strdup) }
+        defer { for case let pointer? in argv { free(pointer) } }
+        return posix_spawn(pid, giveMeRootPath, fileActions, nil, argv + [nil], envp + [nil])
+    }
+}
+#endif
+
 @discardableResult func spawn(command: String, args: [String], root: Bool = false) -> (Int, String, String) {
     var pipestdout: [Int32] = [0, 0]
     var pipestderr: [Int32] = [0, 0]
@@ -160,12 +219,7 @@ final public class MacRootWrapper {
     let spawnStatus: Int32
     if #available(iOS 13, *) {
         if root {
-            var attr: posix_spawnattr_t?
-            posix_spawnattr_init(&attr)
-            posix_spawnattr_set_persona_np(&attr, 99, UInt32(POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE))
-            posix_spawnattr_set_persona_uid_np(&attr, 0)
-            posix_spawnattr_set_persona_gid_np(&attr, 0)
-            spawnStatus = posix_spawn(&pid, command, &fileActions, &attr, argv + [nil], envp + [nil])
+            spawnStatus = RootSpawn.spawn(&pid, command: command, fileActions: &fileActions, args: args, env: env)
         } else {
             spawnStatus = posix_spawn(&pid, command, &fileActions, nil, argv + [nil], envp + [nil])
         }
@@ -174,6 +228,7 @@ final public class MacRootWrapper {
     }
     #endif
     if spawnStatus != 0 {
+        for fd in pipestdout + pipestderr { close(fd) }
         return (Int(spawnStatus), "ITS FAILING HERE", "Error = \(errno)  \(String(cString: strerror(spawnStatus))) \(String(cString: strerror(errno)))\n\(command)")
     }
 
